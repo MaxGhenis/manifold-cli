@@ -1,14 +1,31 @@
 [project]
 name = "manifold-cli"
 version = "0.1.0"
-description = "Lightweight CLI for Manifold Markets"
+description = "Lightweight CLI for Manifold Markets — zero dependencies"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 requires-python = ">=3.10"
+authors = [{ name = "Max Ghenis", email = "mghenis@gmail.com" }]
+keywords = ["manifold", "prediction-markets", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Office/Business :: Financial",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/MaxGhenis/manifold-cli"
+Issues = "https://github.com/MaxGhenis/manifold-cli/issues"
 
 [project.scripts]
 manifold = "manifold_cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
 
 [build-system]
 requires = ["hatchling"]
