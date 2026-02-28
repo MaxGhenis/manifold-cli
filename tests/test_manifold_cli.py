@@ -10,6 +10,7 @@ import pytest
 
 from manifold_cli import (
     ManifoldError,
+    _parse_close_ms,
     api_request,
     do_bet,
     do_me,
@@ -38,6 +39,25 @@ def _make_response(data: dict | list, status: int = 200) -> MagicMock:
     resp.__enter__ = lambda s: s
     resp.__exit__ = MagicMock(return_value=False)
     return resp
+
+
+# ── _parse_close_ms ───────────────────────────────────────────────────
+
+
+class TestParseCloseMs:
+    def test_valid_date(self):
+        ms = _parse_close_ms("2026-06-01")
+        assert isinstance(ms, int)
+        assert ms > 0
+
+    def test_roundtrip(self):
+        from datetime import datetime
+
+        ms = _parse_close_ms("2026-01-15")
+        dt = datetime.fromtimestamp(ms // 1000)
+        assert dt.year == 2026
+        assert dt.month == 1
+        assert dt.day == 15
 
 
 # ── get_api_key ───────────────────────────────────────────────────────

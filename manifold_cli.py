@@ -30,6 +30,11 @@ from urllib.parse import urlencode
 API = "https://api.manifold.markets/v0"
 
 
+def _parse_close_ms(date_str: str) -> int:
+    """Parse YYYY-MM-DD to epoch milliseconds."""
+    return int(datetime.strptime(date_str, "%Y-%m-%d").timestamp() * 1000)
+
+
 class ManifoldError(Exception):
     """Raised on API errors."""
 
@@ -120,7 +125,7 @@ def format_market(d: dict) -> str:
         f"Volume:    M${d.get('volume', 0):.0f}",
         f"Liquidity: M${d.get('totalLiquidity', 0):.0f}",
         f"Bettors:   {d.get('uniqueBettorCount', 0)}",
-        f"Close:     {datetime.fromtimestamp(close / 1000).strftime('%Y-%m-%d') if close else 'n/a'}",
+        f"Close:     {datetime.fromtimestamp(close // 1000).strftime('%Y-%m-%d') if close else 'n/a'}",
     ]
     return "\n".join(lines)
 
@@ -144,7 +149,7 @@ def do_create(
     visibility: str = "public",
     api_key: str | None = None,
 ) -> str:
-    close_ms = int(datetime.strptime(close, "%Y-%m-%d").timestamp() * 1000) if close else None
+    close_ms = _parse_close_ms(close) if close else None
     data: dict = {
         "outcomeType": "BINARY",
         "question": question,
@@ -227,7 +232,7 @@ def do_update(
     if description:
         data["descriptionMarkdown"] = description
     if close:
-        data["closeTime"] = int(datetime.strptime(close, "%Y-%m-%d").timestamp() * 1000)
+        data["closeTime"] = _parse_close_ms(close)
     if question:
         data["question"] = question
     if visibility:
@@ -258,10 +263,7 @@ def do_resolve(
 def _run(fn, *args, **kwargs) -> None:
     try:
         print(fn(*args, **kwargs))
-    except ManifoldError as e:
-        print(str(e), file=sys.stderr)
-        sys.exit(1)
-    except ValueError as e:
+    except (ManifoldError, ValueError) as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
 
