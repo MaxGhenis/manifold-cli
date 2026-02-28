@@ -1,0 +1,15 @@
+[project]
+name = "manifold-cli"
+version = "0.1.0"
+description = "Lightweight CLI for Manifold Markets"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+manifold = "manifold_cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
