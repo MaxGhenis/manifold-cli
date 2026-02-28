@@ -170,6 +170,23 @@ def cmd_positions(args: argparse.Namespace) -> None:
         print(f"  {cid[:12]}  {outcome:>3}  {total_shares:>8.1f} shares  M${total_spent:>6.0f} spent")
 
 
+def cmd_update(args: argparse.Namespace) -> None:
+    data: dict = {}
+    if args.description:
+        data["descriptionMarkdown"] = args.description
+    if args.close:
+        data["closeTime"] = int(datetime.strptime(args.close, "%Y-%m-%d").timestamp() * 1000)
+    if args.question:
+        data["question"] = args.question
+    if args.visibility:
+        data["visibility"] = args.visibility
+    if not data:
+        print("Nothing to update (use -d, -c, -q, or -v)", file=sys.stderr)
+        sys.exit(1)
+    _req("POST", f"/market/{args.contract_id}/update", data)
+    print(f"Updated {args.contract_id}")
+
+
 def cmd_resolve(args: argparse.Namespace) -> None:
     outcome = args.outcome.upper()
     data: dict = {"outcome": outcome}
@@ -221,6 +238,13 @@ def main() -> None:
     sp = sub.add_parser("positions", help="Recent bets grouped by market")
     sp.add_argument("-n", "--limit", type=int, default=50)
 
+    sp = sub.add_parser("update", help="Update market description/close/question")
+    sp.add_argument("contract_id")
+    sp.add_argument("-d", "--description", help="New markdown description")
+    sp.add_argument("-c", "--close", help="New close date YYYY-MM-DD")
+    sp.add_argument("-q", "--question", help="New question text")
+    sp.add_argument("-v", "--visibility", choices=["public", "unlisted"])
+
     sp = sub.add_parser("resolve", help="Resolve a market")
     sp.add_argument("contract_id")
     sp.add_argument("outcome", choices=["yes", "no", "YES", "NO", "MKT", "CANCEL"])
@@ -236,6 +260,7 @@ def main() -> None:
         "bet": cmd_bet,
         "sell": cmd_sell,
         "positions": cmd_positions,
+        "update": cmd_update,
         "resolve": cmd_resolve,
     }[args.cmd](args)
 
