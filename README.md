@@ -3,7 +3,7 @@
 Lightweight CLI for [Manifold Markets](https://manifold.markets). Zero dependencies — uses only the Python standard library.
 
 [![CI](https://github.com/MaxGhenis/manifold-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/MaxGhenis/manifold-cli/actions/workflows/ci.yml)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
+[![Python 3.10–3.14](https://img.shields.io/badge/python-3.10–3.14-blue)](https://python.org)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
 ## Install
