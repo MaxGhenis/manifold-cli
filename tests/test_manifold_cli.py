@@ -10,6 +10,8 @@ import pytest
 
 from manifold_cli import (
     ManifoldError,
+    _amount_to_target,
+    _get_pool,
     _parse_close_ms,
     api_request,
     do_bet,
@@ -318,3 +320,69 @@ class TestMain:
             main(["me"])
         err = capsys.readouterr().err
         assert "500" in err
+
+
+# ── _amount_to_target (CPMM formula) ────────────────────────────────
+
+
+class TestAmountToTarget:
+    def test_yes_bet_moves_prob_up(self):
+        # pool YES=100, NO=10 => p=10/110=9.09%, target=15%
+        a = _amount_to_target(100, 10, 0.15, "YES")
+        # Verify: final pools YES=1000/(10+a), NO=10+a
+        n_final = 10 + a
+        y_final = 100 * 10 / n_final
+        p_final = n_final / (y_final + n_final)
+        assert abs(p_final - 0.15) < 0.001
+
+    def test_no_bet_moves_prob_down(self):
+        # pool YES=100, NO=10 => p=9.09%, target=5%
+        a = _amount_to_target(100, 10, 0.05, "NO")
+        y_final = 100 + a
+        n_final = 100 * 10 / y_final
+        p_final = n_final / (y_final + n_final)
+        assert abs(p_final - 0.05) < 0.001
+
+    def test_already_past_target_returns_zero(self):
+        # p=9.09%, buying YES to target 5% => wrong direction
+        assert _amount_to_target(100, 10, 0.05, "YES") == 0.0
+        # p=9.09%, buying NO to target 15% => wrong direction
+        assert _amount_to_target(100, 10, 0.15, "NO") == 0.0
+
+    def test_already_at_target_returns_zero(self):
+        # p=10/110=9.09%, target=9.09%
+        assert _amount_to_target(100, 10, 10 / 110, "YES") == 0.0
+
+    def test_large_move(self):
+        # pool YES=50, NO=50 => p=50%, target=90%
+        a = _amount_to_target(50, 50, 0.90, "YES")
+        n_final = 50 + a
+        y_final = 50 * 50 / n_final
+        p_final = n_final / (y_final + n_final)
+        assert abs(p_final - 0.90) < 0.001
+        assert a > 0
+
+
+# ── _get_pool ────────────────────────────────────────────────────────
+
+
+class TestGetPool:
+    def test_binary_market(self):
+        market = {"pool": {"YES": 100, "NO": 50}}
+        assert _get_pool(market, None) == (100, 50)
+
+    def test_multi_choice_answer(self):
+        market = {
+            "answers": [
+                {"id": "a1", "pool": {"YES": 80, "NO": 20}},
+                {"id": "a2", "pool": {"YES": 60, "NO": 40}},
+            ]
+        }
+        assert _get_pool(market, "a2") == (60, 40)
+
+    def test_missing_answer_returns_none(self):
+        market = {"answers": [{"id": "a1", "pool": {"YES": 80, "NO": 20}}]}
+        assert _get_pool(market, "missing") is None
+
+    def test_no_pool_returns_none(self):
+        assert _get_pool({}, None) is None

@@ -127,6 +127,12 @@ def format_market(d: dict) -> str:
         f"Bettors:   {d.get('uniqueBettorCount', 0)}",
         f"Close:     {datetime.fromtimestamp(close // 1000).strftime('%Y-%m-%d') if close else 'n/a'}",
     ]
+    answers = d.get("answers")
+    if answers:
+        lines.append("Answers:")
+        for a in answers:
+            p = a.get("probability", 0)
+            lines.append(f"  {a['id']:<16} {p:>5.1%}  {a['text']}")
     return "\n".join(lines)
 
 
@@ -166,13 +172,77 @@ def do_create(
     return f"Created: {d.get('url', d.get('id', '?'))}\nID:      {d['id']}\nProb:    {d.get('probability', '?')}"
 
 
+def _amount_to_target(pool_yes: float, pool_no: float, target: float, outcome: str) -> float:
+    """Mana needed to move CPMM price from current to target probability.
+
+    CPMM invariant: pool_YES * pool_NO = k (constant).
+    Current p(YES) = pool_NO / (pool_YES + pool_NO).
+
+    Buying YES with amount a:
+      final pools -> YES: k/(n+a), NO: n+a
+      p_final = (n+a)^2 / (k + (n+a)^2)
+      => a = sqrt(target * y * n / (1 - target)) - n
+
+    Buying NO with amount a:
+      final pools -> YES: y+a, NO: k/(y+a)
+      p_final = k / ((y+a)^2 + k)
+      => a = sqrt(y * n * (1 - target) / target) - y
+    """
+    y, n = pool_yes, pool_no
+    current = n / (y + n) if (y + n) > 0 else 0.5
+
+    if outcome == "YES":
+        if target <= current:
+            return 0.0
+        return max(0.0, (target * y * n / (1 - target)) ** 0.5 - n)
+    else:
+        if target >= current:
+            return 0.0
+        return max(0.0, (y * n * (1 - target) / target) ** 0.5 - y)
+
+
+def _get_pool(market: dict, answer_id: str | None) -> tuple[float, float] | None:
+    """Extract YES/NO pool for a binary market or a specific multi-choice answer."""
+    if answer_id:
+        for a in market.get("answers", []):
+            if a["id"] == answer_id:
+                pool = a.get("pool", {})
+                return pool.get("YES", 0), pool.get("NO", 0)
+        return None
+    pool = market.get("pool", {})
+    if "YES" in pool and "NO" in pool:
+        return pool["YES"], pool["NO"]
+    return None
+
+
 def do_bet(
     contract_id: str,
     outcome: str,
     amount: int,
     limit_prob: float | None = None,
+    answer_id: str | None = None,
     api_key: str | None = None,
 ) -> str:
+    market = api_request("GET", f"/market/{contract_id}", auth=False)
+    liquidity = market.get("totalLiquidity", 0)
+
+    # Cap bet at the amount that would move price to limit_prob
+    if limit_prob is not None:
+        pool = _get_pool(market, answer_id)
+        if pool:
+            y, n = pool
+            raw = _amount_to_target(y, n, limit_prob, outcome.upper())
+            if raw < 0.5:
+                current = n / (y + n) if (y + n) > 0 else 0
+                return f"No bet: price already {'at' if abs(current - limit_prob) < 0.001 else 'past'} target ({current:.1%} vs {limit_prob:.1%})"
+            cap = max(1, round(raw))
+            if amount > cap:
+                print(
+                    f"Capping M${amount} -> M${cap} (amount to reach {limit_prob:.0%} target)",
+                    file=sys.stderr,
+                )
+                amount = cap
+
     data: dict = {
         "amount": amount,
         "contractId": contract_id,
@@ -180,12 +250,16 @@ def do_bet(
     }
     if limit_prob is not None:
         data["limitProb"] = limit_prob
+    if answer_id is not None:
+        data["answerId"] = answer_id
 
     d = api_request("POST", "/bet", data, api_key=api_key)
     shares = d.get("shares", "?")
+    prob_before = d.get("probBefore", "?")
     prob_after = d.get("probAfter", d.get("probability", "?"))
     if isinstance(shares, (int, float)):
-        return f"Filled M${d.get('amount', '?')}  ->  {shares:.1f} shares  prob->{prob_after:.0%}"
+        prob_str = f"{prob_before:.0%}->{prob_after:.0%}" if isinstance(prob_before, (int, float)) else f"->{prob_after:.0%}"
+        return f"Filled M${d.get('amount', '?')}  ->  {shares:.1f} shares  prob {prob_str}  (liq M${liquidity:.0f})"
     return f"Result: {json.dumps(d)[:200]}"
 
 
@@ -193,11 +267,14 @@ def do_sell(
     contract_id: str,
     outcome: str = "YES",
     shares: float | None = None,
+    answer_id: str | None = None,
     api_key: str | None = None,
 ) -> str:
     data: dict = {"outcome": outcome.upper()}
     if shares:
         data["shares"] = shares
+    if answer_id is not None:
+        data["answerId"] = answer_id
     d = api_request("POST", f"/market/{contract_id}/sell", data, api_key=api_key)
     return f"Sold: {json.dumps(d)[:200]}"
 
@@ -241,6 +318,132 @@ def do_update(
         raise ValueError("Nothing to update (use -d, -c, -q, or -v)")
     api_request("POST", f"/market/{contract_id}/update", data, api_key=api_key)
     return f"Updated {contract_id}"
+
+
+def _kelly_fraction(p_true: float, p_market: float) -> tuple[str, float]:
+    """Return (side, kelly_fraction) for a bet. Positive fraction = bet."""
+    if p_true > p_market:
+        return "YES", (p_true - p_market) / (1 - p_market)
+    elif p_true < p_market:
+        return "NO", (p_market - p_true) / p_market
+    return "YES", 0.0
+
+
+
+def do_autobet(
+    contract_id: str,
+    targets: str,
+    fraction: float = 0.5,
+    dry_run: bool = False,
+    api_key: str | None = None,
+) -> str:
+    """Auto-bet with Kelly + CPMM cap. Handles single and multi-target.
+
+    Single:  '0.65' (binary) or 'answer_id=0.13' (one multi-choice answer)
+    Multi:   'id1=0.13,id2=0.03,id3=0.77'  (re-fetches between bets)
+    """
+    me = api_request("GET", "/me", api_key=api_key)
+    bankroll = me["balance"]
+    market = api_request("GET", f"/market/{contract_id}", auth=False)
+    liquidity = market.get("totalLiquidity", 0)
+    is_multi = bool(market.get("answers"))
+
+    # Parse targets
+    target_map: dict[str | None, float] = {}
+    if "=" in targets:
+        for pair in targets.split(","):
+            k, v = pair.strip().split("=")
+            target_map[k.strip()] = float(v.strip())
+    else:
+        target_map[None] = float(targets)
+
+    lines = [f"Bankroll M${bankroll:.0f}  |  {fraction:.0%} Kelly  |  Liq M${liquidity:.0f}", ""]
+
+    # Build plan from current state
+    plan: list[dict] = []
+    for answer_id, p_true in target_map.items():
+        pool = _get_pool(market, answer_id)
+        if not pool:
+            lines.append(f"  {answer_id or 'binary'}: pool not found, skipping")
+            continue
+        y, n = pool
+        p_market = n / (y + n) if (y + n) > 0 else 0.5
+        side, kelly = _kelly_fraction(p_true, p_market)
+        bet_kelly = kelly * fraction * bankroll
+        amt_to_target = _amount_to_target(y, n, p_true, side)
+        bet = max(0, round(min(bet_kelly, amt_to_target)))
+
+        label = "binary"
+        if answer_id:
+            for a in market.get("answers", []):
+                if a["id"] == answer_id:
+                    label = a["text"]
+                    break
+
+        plan.append({
+            "answer_id": answer_id, "label": label, "side": side,
+            "p_market": p_market, "p_true": p_true,
+            "kelly_amt": bet_kelly, "cpmm_cap": amt_to_target, "bet": bet,
+        })
+
+    # Sort biggest edge first
+    plan.sort(key=lambda x: abs(x["p_true"] - x["p_market"]), reverse=True)
+
+    # Display plan
+    for p in plan:
+        edge = p["p_true"] - p["p_market"]
+        lines.append(
+            f"  {p['label']:<20} {p['p_market']:>5.1%} -> {p['p_true']:>5.1%}  "
+            f"{p['side']:>3} M${p['bet']}"
+            f"  (Kelly M${p['kelly_amt']:.0f}, CPMM M${p['cpmm_cap']:.0f})"
+        )
+
+    if dry_run:
+        lines.append("\nDry run. Remove -n/--dry-run to execute.")
+        return "\n".join(lines)
+
+    # Execute: re-fetch market between each bet for multi-choice accuracy
+    lines.append("")
+    for p in plan:
+        if p["bet"] < 1:
+            lines.append(f"  {p['label']}: skip (< M$1)")
+            continue
+
+        # Re-fetch for fresh pools (previous bets shift other answers)
+        if len(plan) > 1:
+            market = api_request("GET", f"/market/{contract_id}", auth=False)
+            pool = _get_pool(market, p["answer_id"])
+            if not pool:
+                lines.append(f"  {p['label']}: pool not found")
+                continue
+            y, n = pool
+            p_market_now = n / (y + n) if (y + n) > 0 else 0.5
+            side, kelly = _kelly_fraction(p["p_true"], p_market_now)
+            bet_kelly = kelly * fraction * bankroll
+            amt_to_target = _amount_to_target(y, n, p["p_true"], side)
+            if amt_to_target < 0.5:
+                lines.append(f"  {p['label']}: already at target ({p_market_now:.1%})")
+                continue
+            bet = max(1, round(min(bet_kelly, amt_to_target)))
+        else:
+            bet = p["bet"]
+            side = p["side"]
+
+        data: dict = {
+            "amount": bet,
+            "contractId": contract_id,
+            "outcome": side,
+            "limitProb": p["p_true"],
+        }
+        if p["answer_id"]:
+            data["answerId"] = p["answer_id"]
+
+        d = api_request("POST", "/bet", data, api_key=api_key)
+        shares = d.get("shares", 0)
+        prob_after = d.get("probAfter", 0)
+        lines.append(f"  {p['label']}: {side} M${d.get('amount', bet)} -> {shares:.1f} shares  now {prob_after:.1%}")
+
+    return "\n".join(lines)
 
 
 def do_resolve(
@@ -297,12 +500,14 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("contract_id")
     sp.add_argument("outcome", choices=["yes", "no", "YES", "NO"])
     sp.add_argument("amount", type=int, help="Mana amount")
-    sp.add_argument("--limit-prob", type=float, help="Limit order probability 0.01-0.99")
+    sp.add_argument("--limit-prob", type=float, help="Target probability — caps bet to avoid overshooting")
+    sp.add_argument("-a", "--answer-id", help="Answer ID for multi-choice markets")
 
     sp = sub.add_parser("sell", help="Sell shares")
     sp.add_argument("contract_id")
     sp.add_argument("--outcome", default="YES", choices=["YES", "NO"])
     sp.add_argument("--shares", type=float, help="Shares to sell (default: all)")
+    sp.add_argument("-a", "--answer-id", help="Answer ID for multi-choice markets")
 
     sp = sub.add_parser("positions", help="Recent bets grouped by market")
     sp.add_argument("-n", "--limit", type=int, default=50)
@@ -313,6 +518,15 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("-c", "--close", help="New close date YYYY-MM-DD")
     sp.add_argument("-q", "--question", help="New question text")
     sp.add_argument("-v", "--visibility", choices=["public", "unlisted"])
+
+    sp = sub.add_parser("autobet", help="Kelly + CPMM auto-bet")
+    sp.add_argument("contract_id")
+    sp.add_argument(
+        "targets",
+        help="True probs: '0.65' (binary), 'id=0.13' (single), 'id1=0.13,id2=0.03' (multi)",
+    )
+    sp.add_argument("-f", "--fraction", type=float, default=0.5, help="Kelly fraction (default 0.5)")
+    sp.add_argument("-n", "--dry-run", action="store_true", help="Show plan without betting")
 
     sp = sub.add_parser("resolve", help="Resolve a market")
     sp.add_argument("contract_id")
@@ -329,11 +543,16 @@ def main(argv: list[str] | None = None) -> None:
         "create": lambda: _run(
             do_create, args.question, args.prob, args.close, args.description, args.liquidity, args.visibility
         ),
-        "bet": lambda: _run(do_bet, args.contract_id, args.outcome, args.amount, args.limit_prob),
-        "sell": lambda: _run(do_sell, args.contract_id, args.outcome, args.shares),
+        "bet": lambda: _run(
+            do_bet, args.contract_id, args.outcome, args.amount, args.limit_prob, args.answer_id,
+        ),
+        "sell": lambda: _run(do_sell, args.contract_id, args.outcome, args.shares, args.answer_id),
         "positions": lambda: _run(do_positions, args.limit),
         "update": lambda: _run(
             do_update, args.contract_id, args.description, args.close, args.question, args.visibility
+        ),
+        "autobet": lambda: _run(
+            do_autobet, args.contract_id, args.targets, args.fraction, args.dry_run,
         ),
         "resolve": lambda: _run(do_resolve, args.contract_id, args.outcome, args.prob),
     }
