@@ -93,15 +93,37 @@ manifold create -q "Q?" -p 50 -l 500 -v unlisted
 
 ```bash
 manifold bet CONTRACT_ID yes 100
-manifold bet CONTRACT_ID no 50 --limit-prob 0.40   # Limit order
+manifold bet CONTRACT_ID no 50 --limit-prob 0.40     # Limit by probability
+manifold bet CONTRACT_ID no 50 --limit-value 41.5    # Pseudo-numeric target value
 ```
 
 | Argument | Description |
 |----------|-------------|
 | `contract_id` | Market ID |
 | `outcome` | `yes` or `no` |
-| `amount` | Mana amount (integer) |
+| `amount` | Mana amount |
 | `--limit-prob` | Limit order probability (0.01-0.99) |
+| `--limit-value` | Displayed target value for `PSEUDO_NUMERIC` markets |
+
+Limit-capped bets first call Manifold's `dryRun` mode and then submit only the fillable amount, avoiding accidental overshoots or resting limit orders.
+
+### `autobet` — Kelly-sized target bets
+
+```bash
+manifold autobet CONTRACT_ID 0.25 -n
+manifold autobet CONTRACT_ID 283 --value-targets -n
+manifold autobet CONTRACT_ID 283 --value-targets
+```
+
+`autobet` compares your target to the live market price, sizes the bet with fractional Kelly, and caps it at the amount needed to hit the target.
+
+| Argument/flag | Description |
+|---------------|-------------|
+| `contract_id` | Market ID |
+| `targets` | Target probability, or displayed value with `--value-targets` |
+| `-f, --fraction` | Kelly fraction (default: 0.5) |
+| `--value-targets` | Interpret targets as displayed pseudo-numeric values |
+| `-n, --dry-run` | Show the plan without placing bets |
 
 ### `sell` — Sell shares
 

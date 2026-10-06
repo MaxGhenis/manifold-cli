@@ -13,7 +13,10 @@ from manifold_cli import (
     _amount_to_target,
     _get_pool,
     _parse_close_ms,
+    _prob_to_value,
+    _value_to_prob,
     api_request,
+    do_autobet,
     do_bet,
     do_me,
     do_search,
@@ -183,6 +186,22 @@ class TestFormatMarket:
         out = format_market(d)
         assert "Close:     n/a" in out
 
+    def test_pseudo_numeric_value(self):
+        d = {
+            "question": "How many?",
+            "id": "num1",
+            "outcomeType": "PSEUDO_NUMERIC",
+            "probability": 0.5,
+            "value": 42,
+            "volume": 10,
+            "totalLiquidity": 250,
+            "uniqueBettorCount": 2,
+            "closeTime": None,
+        }
+        out = format_market(d)
+        assert "Prob:      50%" in out
+        assert "Value:     42" in out
+
 
 # ── do_me ─────────────────────────────────────────────────────────────
 
@@ -256,6 +275,73 @@ class TestDoBet:
         do_bet("abc", "yes", 10, limit_prob=0.60)
         body = json.loads(mock_urlopen.call_args[0][0].data)
         assert body["limitProb"] == 0.60
+
+    def test_limit_prob_caps_to_dry_run_fill(self, mock_urlopen, monkeypatch):
+        monkeypatch.setenv("MANIFOLD_API_KEY", "k")
+        market = {"probability": 0.49, "totalLiquidity": 250}
+        preview = {
+            "amount": 5.5,
+            "shares": 10,
+            "probBefore": 0.49,
+            "probAfter": 0.48,
+            "isFilled": False,
+        }
+        real = {
+            "amount": 5.5,
+            "shares": 10,
+            "probBefore": 0.49,
+            "probAfter": 0.48,
+        }
+        mock_urlopen.side_effect = [
+            _make_response(market),
+            _make_response(preview),
+            _make_response(real),
+        ]
+        out = do_bet("abc", "no", 100, limit_prob=0.48)
+        assert "Filled M$5.5" in out
+        body = json.loads(mock_urlopen.call_args[0][0].data)
+        assert body["amount"] == 5.5
+        assert body["limitProb"] == 0.48
+
+    def test_limit_value_converts_to_probability(self, mock_urlopen, monkeypatch):
+        monkeypatch.setenv("MANIFOLD_API_KEY", "k")
+        market = {
+            "outcomeType": "PSEUDO_NUMERIC",
+            "probability": 0.4909090909,
+            "value": 42,
+            "min": 15,
+            "max": 70,
+            "totalLiquidity": 250,
+        }
+        preview = {
+            "amount": 5.5,
+            "shares": 10,
+            "probBefore": 0.4909090909,
+            "probAfter": 0.4818181818,
+            "isFilled": False,
+        }
+        real = {
+            "amount": 5.5,
+            "shares": 10,
+            "probBefore": 0.4909090909,
+            "probAfter": 0.4818181818,
+        }
+        mock_urlopen.side_effect = [
+            _make_response(market),
+            _make_response(preview),
+            _make_response(real),
+        ]
+        out = do_bet("abc", "no", 100, limit_value=41.5)
+        body = json.loads(mock_urlopen.call_args[0][0].data)
+        assert body["limitProb"] == pytest.approx((41.5 - 15) / (70 - 15))
+        assert body["amount"] == 5.5
+        assert "value 41.5" in out
+
+    def test_limit_value_rejects_binary_market(self, mock_urlopen, monkeypatch):
+        monkeypatch.setenv("MANIFOLD_API_KEY", "k")
+        mock_urlopen.return_value = _make_response({"outcomeType": "BINARY", "probability": 0.5})
+        with pytest.raises(ValueError, match="PSEUDO_NUMERIC"):
+            do_bet("abc", "no", 100, limit_value=41.5)
 
 
 # ── do_update ─────────────────────────────────────────────────────────
@@ -386,3 +472,55 @@ class TestGetPool:
 
     def test_no_pool_returns_none(self):
         assert _get_pool({}, None) is None
+
+
+# ── pseudo-numeric conversion ─────────────────────────────────────────
+
+
+class TestPseudoNumericConversion:
+    def test_linear_value_to_probability(self):
+        market = {"outcomeType": "PSEUDO_NUMERIC", "min": 15, "max": 70}
+        assert _value_to_prob(market, 41.5) == pytest.approx((41.5 - 15) / 55)
+        assert _prob_to_value(market, (41.5 - 15) / 55) == pytest.approx(41.5)
+
+    def test_log_value_to_probability(self):
+        market = {"outcomeType": "PSEUDO_NUMERIC", "min": 1, "max": 100, "isLogScale": True}
+        probability = _value_to_prob(market, 10)
+        assert _prob_to_value(market, probability) == pytest.approx(10)
+
+    def test_value_outside_range_raises(self):
+        market = {"outcomeType": "PSEUDO_NUMERIC", "min": 15, "max": 70}
+        with pytest.raises(ValueError, match="outside market range"):
+            _value_to_prob(market, 100)
+
+
+# ── do_autobet ────────────────────────────────────────────────────────
+
+
+class TestDoAutobet:
+    def test_value_targets_use_market_value(self, mock_urlopen, monkeypatch):
+        monkeypatch.setenv("MANIFOLD_API_KEY", "k")
+        me = {"balance": 1000}
+        market = {
+            "outcomeType": "PSEUDO_NUMERIC",
+            "probability": 0.4909090909,
+            "value": 42,
+            "min": 15,
+            "max": 70,
+            "totalLiquidity": 250,
+        }
+        preview = {
+            "amount": 5.5,
+            "shares": 10,
+            "probBefore": 0.4909090909,
+            "probAfter": 0.4818181818,
+            "isFilled": False,
+        }
+        mock_urlopen.side_effect = [
+            _make_response(me),
+            _make_response(market),
+            _make_response(preview),
+        ]
+        out = do_autobet("abc", "41.5", dry_run=True, value_targets=True)
+        assert "42 ->    41.5 value" in out
+        assert "NO M$5.5" in out

@@ -25,6 +25,7 @@ import sys
 import urllib.error
 import urllib.request
 from datetime import datetime
+from math import log
 from urllib.parse import urlencode
 
 API = "https://api.manifold.markets/v0"
@@ -127,6 +128,8 @@ def format_market(d: dict) -> str:
         f"Bettors:   {d.get('uniqueBettorCount', 0)}",
         f"Close:     {datetime.fromtimestamp(close // 1000).strftime('%Y-%m-%d') if close else 'n/a'}",
     ]
+    if d.get("outcomeType") == "PSEUDO_NUMERIC" and d.get("value") is not None:
+        lines.insert(4, f"Value:     {_format_number(d['value'])}")
     answers = d.get("answers")
     if answers:
         lines.append("Answers:")
@@ -215,33 +218,157 @@ def _get_pool(market: dict, answer_id: str | None) -> tuple[float, float] | None
     return None
 
 
-def do_bet(
+def _format_number(value: float) -> str:
+    """Format a market value compactly without hiding meaningful decimals."""
+    if abs(value - round(value)) < 1e-9:
+        return f"{value:.0f}"
+    return f"{value:.4f}".rstrip("0").rstrip(".")
+
+
+def _is_pseudo_numeric(market: dict) -> bool:
+    return market.get("outcomeType") == "PSEUDO_NUMERIC"
+
+
+def _require_numeric_bounds(market: dict) -> tuple[float, float]:
+    if not _is_pseudo_numeric(market):
+        raise ValueError("--limit-value/--value-targets only works for PSEUDO_NUMERIC markets")
+    min_value = market.get("min")
+    max_value = market.get("max")
+    if min_value is None or max_value is None:
+        raise ValueError("Pseudo-numeric market is missing min/max bounds")
+    return float(min_value), float(max_value)
+
+
+def _value_to_prob(market: dict, value: float) -> float:
+    """Map a pseudo-numeric displayed value to its underlying probability."""
+    min_value, max_value = _require_numeric_bounds(market)
+    if value < min_value or value > max_value:
+        raise ValueError(
+            f"Target value {_format_number(value)} outside market range "
+            f"{_format_number(min_value)}-{_format_number(max_value)}"
+        )
+
+    if market.get("isLogScale"):
+        base = max_value - min_value + 1
+        return log(value - min_value + 1, base)
+    return (value - min_value) / (max_value - min_value)
+
+
+def _prob_to_value(market: dict, probability: float) -> float:
+    """Map a pseudo-numeric underlying probability to its displayed value."""
+    min_value, max_value = _require_numeric_bounds(market)
+    if market.get("isLogScale"):
+        return (max_value - min_value + 1) ** probability + min_value - 1
+    return min_value + (max_value - min_value) * probability
+
+
+def _get_probability(market: dict, answer_id: str | None = None) -> float | None:
+    """Extract the displayed probability for binary, numeric, or one multi answer."""
+    if answer_id:
+        for a in market.get("answers", []):
+            if a["id"] == answer_id:
+                return a.get("probability")
+        return None
+    return market.get("probability")
+
+
+def _target_to_probability(
+    market: dict,
+    target: float,
+    answer_id: str | None = None,
+    *,
+    value_target: bool = False,
+) -> float:
+    if value_target:
+        if answer_id:
+            raise ValueError("--value-targets is not supported with answer IDs")
+        return _value_to_prob(market, target)
+    return target
+
+
+def _format_target(market: dict, probability: float, *, value_target: bool = False) -> str:
+    if value_target:
+        return _format_number(_prob_to_value(market, probability))
+    return f"{probability:.1%}"
+
+
+def _dry_run_bet(
     contract_id: str,
     outcome: str,
-    amount: int,
+    amount: float,
     limit_prob: float | None = None,
     answer_id: str | None = None,
     api_key: str | None = None,
+) -> dict:
+    data: dict = {
+        "amount": amount,
+        "contractId": contract_id,
+        "outcome": outcome.upper(),
+        "dryRun": True,
+    }
+    if limit_prob is not None:
+        data["limitProb"] = limit_prob
+    if answer_id is not None:
+        data["answerId"] = answer_id
+    return api_request("POST", "/bet", data, api_key=api_key)
+
+
+def _cap_amount_with_dry_run(
+    contract_id: str,
+    outcome: str,
+    amount: float,
+    limit_prob: float,
+    answer_id: str | None = None,
+    api_key: str | None = None,
+) -> tuple[float, dict]:
+    """Ask Manifold how much would fill before the limit and use that amount."""
+    preview = _dry_run_bet(contract_id, outcome, amount, limit_prob, answer_id, api_key)
+    fill_amount = float(preview.get("amount", 0) or 0)
+    if fill_amount <= 0:
+        return 0.0, preview
+    return min(float(amount), fill_amount), preview
+
+
+def do_bet(
+    contract_id: str,
+    outcome: str,
+    amount: float,
+    limit_prob: float | None = None,
+    limit_value: float | None = None,
+    answer_id: str | None = None,
+    api_key: str | None = None,
 ) -> str:
+    if limit_prob is not None and limit_value is not None:
+        raise ValueError("Use either --limit-prob or --limit-value, not both")
+
     market = api_request("GET", f"/market/{contract_id}", auth=False)
     liquidity = market.get("totalLiquidity", 0)
+    value_target = limit_value is not None
+    if limit_value is not None:
+        limit_prob = _value_to_prob(market, float(limit_value))
 
-    # Cap bet at the amount that would move price to limit_prob
+    # Cap bet at the amount that would move price to limit_prob. Use Manifold's
+    # own dry-run calculation because pseudo-numeric and p-weighted CPMM pools
+    # do not always follow the simple x*y=k formula.
     if limit_prob is not None:
-        pool = _get_pool(market, answer_id)
-        if pool:
-            y, n = pool
-            raw = _amount_to_target(y, n, limit_prob, outcome.upper())
-            if raw < 0.5:
-                current = n / (y + n) if (y + n) > 0 else 0
-                return f"No bet: price already {'at' if abs(current - limit_prob) < 0.001 else 'past'} target ({current:.1%} vs {limit_prob:.1%})"
-            cap = max(1, round(raw))
-            if amount > cap:
-                print(
-                    f"Capping M${amount} -> M${cap} (amount to reach {limit_prob:.0%} target)",
-                    file=sys.stderr,
-                )
-                amount = cap
+        capped_amount, preview = _cap_amount_with_dry_run(
+            contract_id, outcome, amount, limit_prob, answer_id, api_key
+        )
+        prob_before = preview.get("probBefore")
+        if capped_amount <= 0:
+            current = prob_before if isinstance(prob_before, (int, float)) else _get_probability(market, answer_id)
+            current_str = f"{current:.1%}" if isinstance(current, (int, float)) else "unknown"
+            target_str = _format_target(market, limit_prob, value_target=value_target)
+            units = "value" if value_target else "prob"
+            return f"No bet: price already at/past target ({current_str} vs {units} {target_str})"
+        if capped_amount < amount:
+            target_str = _format_target(market, limit_prob, value_target=value_target)
+            print(
+                f"Capping M${_format_number(amount)} -> M${_format_number(capped_amount)} "
+                f"(amount to reach target {target_str})",
+                file=sys.stderr,
+            )
+            amount = capped_amount
 
     data: dict = {
         "amount": amount,
@@ -259,7 +386,13 @@ def do_bet(
     prob_after = d.get("probAfter", d.get("probability", "?"))
     if isinstance(shares, (int, float)):
         prob_str = f"{prob_before:.0%}->{prob_after:.0%}" if isinstance(prob_before, (int, float)) else f"->{prob_after:.0%}"
-        return f"Filled M${d.get('amount', '?')}  ->  {shares:.1f} shares  prob {prob_str}  (liq M${liquidity:.0f})"
+        value_str = ""
+        if _is_pseudo_numeric(market) and isinstance(prob_after, (int, float)):
+            value_str = f"  value {_format_number(_prob_to_value(market, prob_after))}"
+        return (
+            f"Filled M${_format_number(float(d.get('amount', 0)))}  ->  {shares:.1f} shares  "
+            f"prob {prob_str}{value_str}  (liq M${liquidity:.0f})"
+        )
     return f"Result: {json.dumps(d)[:200]}"
 
 
@@ -335,12 +468,14 @@ def do_autobet(
     targets: str,
     fraction: float = 0.5,
     dry_run: bool = False,
+    value_targets: bool = False,
     api_key: str | None = None,
 ) -> str:
     """Auto-bet with Kelly + CPMM cap. Handles single and multi-target.
 
     Single:  '0.65' (binary) or 'answer_id=0.13' (one multi-choice answer)
     Multi:   'id1=0.13,id2=0.03,id3=0.77'  (re-fetches between bets)
+    Pseudo-numeric values: pass value_targets=True and use displayed values.
     """
     me = api_request("GET", "/me", api_key=api_key)
     bankroll = me["balance"]
@@ -362,18 +497,25 @@ def do_autobet(
     # Build plan from current state
     plan: list[dict] = []
     for answer_id, p_true in target_map.items():
-        pool = _get_pool(market, answer_id)
-        if not pool:
-            lines.append(f"  {answer_id or 'binary'}: pool not found, skipping")
+        try:
+            p_true = _target_to_probability(market, p_true, answer_id, value_target=value_targets)
+        except ValueError as e:
+            lines.append(f"  {answer_id or 'binary'}: {e}")
             continue
-        y, n = pool
-        p_market = n / (y + n) if (y + n) > 0 else 0.5
+        p_market = _get_probability(market, answer_id)
+        if p_market is None:
+            lines.append(f"  {answer_id or 'binary'}: probability not found, skipping")
+            continue
         side, kelly = _kelly_fraction(p_true, p_market)
         bet_kelly = kelly * fraction * bankroll
-        amt_to_target = _amount_to_target(y, n, p_true, side)
-        bet = max(0, round(min(bet_kelly, amt_to_target)))
+        if bet_kelly < 1:
+            bet = 0.0
+            target_hit = False
+        else:
+            bet, preview = _cap_amount_with_dry_run(contract_id, side, bet_kelly, p_true, answer_id, api_key)
+            target_hit = bool(preview) and not preview.get("isFilled", True)
 
-        label = "binary"
+        label = "market" if not market.get("answers") else "answer"
         if answer_id:
             for a in market.get("answers", []):
                 if a["id"] == answer_id:
@@ -383,7 +525,7 @@ def do_autobet(
         plan.append({
             "answer_id": answer_id, "label": label, "side": side,
             "p_market": p_market, "p_true": p_true,
-            "kelly_amt": bet_kelly, "cpmm_cap": amt_to_target, "bet": bet,
+            "kelly_amt": bet_kelly, "target_hit": target_hit, "bet": bet,
         })
 
     # Sort biggest edge first
@@ -391,11 +533,14 @@ def do_autobet(
 
     # Display plan
     for p in plan:
-        edge = p["p_true"] - p["p_market"]
+        current_str = _format_target(market, p["p_market"], value_target=value_targets)
+        target_str = _format_target(market, p["p_true"], value_target=value_targets)
+        unit = "value" if value_targets else "prob"
+        cap_note = "target cap" if p["target_hit"] else "Kelly"
         lines.append(
-            f"  {p['label']:<20} {p['p_market']:>5.1%} -> {p['p_true']:>5.1%}  "
-            f"{p['side']:>3} M${p['bet']}"
-            f"  (Kelly M${p['kelly_amt']:.0f}, CPMM M${p['cpmm_cap']:.0f})"
+            f"  {p['label']:<20} {current_str:>7} -> {target_str:>7} {unit:<5}  "
+            f"{p['side']:>3} M${_format_number(p['bet'])}"
+            f"  ({cap_note}; Kelly M${_format_number(p['kelly_amt'])})"
         )
 
     if dry_run:
@@ -409,25 +554,24 @@ def do_autobet(
             lines.append(f"  {p['label']}: skip (< M$1)")
             continue
 
-        # Re-fetch for fresh pools (previous bets shift other answers)
-        if len(plan) > 1:
-            market = api_request("GET", f"/market/{contract_id}", auth=False)
-            pool = _get_pool(market, p["answer_id"])
-            if not pool:
-                lines.append(f"  {p['label']}: pool not found")
-                continue
-            y, n = pool
-            p_market_now = n / (y + n) if (y + n) > 0 else 0.5
-            side, kelly = _kelly_fraction(p["p_true"], p_market_now)
-            bet_kelly = kelly * fraction * bankroll
-            amt_to_target = _amount_to_target(y, n, p["p_true"], side)
-            if amt_to_target < 0.5:
-                lines.append(f"  {p['label']}: already at target ({p_market_now:.1%})")
-                continue
-            bet = max(1, round(min(bet_kelly, amt_to_target)))
-        else:
-            bet = p["bet"]
-            side = p["side"]
+        # Re-fetch immediately before betting so dry-run sizing uses the latest
+        # price and previous bets in the same command are accounted for.
+        market = api_request("GET", f"/market/{contract_id}", auth=False)
+        p_market_now = _get_probability(market, p["answer_id"])
+        if p_market_now is None:
+            lines.append(f"  {p['label']}: probability not found")
+            continue
+        side, kelly = _kelly_fraction(p["p_true"], p_market_now)
+        bet_kelly = kelly * fraction * bankroll
+        if bet_kelly < 1:
+            lines.append(f"  {p['label']}: skip (< M$1 Kelly)")
+            continue
+        bet, preview = _cap_amount_with_dry_run(contract_id, side, bet_kelly, p["p_true"], p["answer_id"], api_key)
+        if bet < 1:
+            target_str = _format_target(market, p["p_true"], value_target=value_targets)
+            current_str = _format_target(market, p_market_now, value_target=value_targets)
+            lines.append(f"  {p['label']}: already at target ({current_str} vs {target_str})")
+            continue
 
         data: dict = {
             "amount": bet,
@@ -441,7 +585,11 @@ def do_autobet(
         d = api_request("POST", "/bet", data, api_key=api_key)
         shares = d.get("shares", 0)
         prob_after = d.get("probAfter", 0)
-        lines.append(f"  {p['label']}: {side} M${d.get('amount', bet)} -> {shares:.1f} shares  now {prob_after:.1%}")
+        after = _format_target(market, prob_after, value_target=value_targets) if isinstance(prob_after, (int, float)) else "?"
+        lines.append(
+            f"  {p['label']}: {side} M${_format_number(float(d.get('amount', bet)))} "
+            f"-> {shares:.1f} shares  now {after}"
+        )
 
     return "\n".join(lines)
 
@@ -499,8 +647,9 @@ def main(argv: list[str] | None = None) -> None:
     sp = sub.add_parser("bet", help="Place a bet")
     sp.add_argument("contract_id")
     sp.add_argument("outcome", choices=["yes", "no", "YES", "NO"])
-    sp.add_argument("amount", type=int, help="Mana amount")
+    sp.add_argument("amount", type=float, help="Mana amount")
     sp.add_argument("--limit-prob", type=float, help="Target probability — caps bet to avoid overshooting")
+    sp.add_argument("--limit-value", type=float, help="Target displayed value for PSEUDO_NUMERIC markets")
     sp.add_argument("-a", "--answer-id", help="Answer ID for multi-choice markets")
 
     sp = sub.add_parser("sell", help="Sell shares")
@@ -519,13 +668,14 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("-q", "--question", help="New question text")
     sp.add_argument("-v", "--visibility", choices=["public", "unlisted"])
 
-    sp = sub.add_parser("autobet", help="Kelly + CPMM auto-bet")
+    sp = sub.add_parser("autobet", help="Kelly-sized target auto-bet")
     sp.add_argument("contract_id")
     sp.add_argument(
         "targets",
         help="True probs: '0.65' (binary), 'id=0.13' (single), 'id1=0.13,id2=0.03' (multi)",
     )
     sp.add_argument("-f", "--fraction", type=float, default=0.5, help="Kelly fraction (default 0.5)")
+    sp.add_argument("--value-targets", action="store_true", help="Interpret targets as displayed pseudo-numeric values")
     sp.add_argument("-n", "--dry-run", action="store_true", help="Show plan without betting")
 
     sp = sub.add_parser("resolve", help="Resolve a market")
@@ -544,7 +694,7 @@ def main(argv: list[str] | None = None) -> None:
             do_create, args.question, args.prob, args.close, args.description, args.liquidity, args.visibility
         ),
         "bet": lambda: _run(
-            do_bet, args.contract_id, args.outcome, args.amount, args.limit_prob, args.answer_id,
+            do_bet, args.contract_id, args.outcome, args.amount, args.limit_prob, args.limit_value, args.answer_id,
         ),
         "sell": lambda: _run(do_sell, args.contract_id, args.outcome, args.shares, args.answer_id),
         "positions": lambda: _run(do_positions, args.limit),
@@ -552,7 +702,7 @@ def main(argv: list[str] | None = None) -> None:
             do_update, args.contract_id, args.description, args.close, args.question, args.visibility
         ),
         "autobet": lambda: _run(
-            do_autobet, args.contract_id, args.targets, args.fraction, args.dry_run,
+            do_autobet, args.contract_id, args.targets, args.fraction, args.dry_run, args.value_targets,
         ),
         "resolve": lambda: _run(do_resolve, args.contract_id, args.outcome, args.prob),
     }
